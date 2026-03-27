@@ -292,9 +292,54 @@ export class ConfigService {
       createdAt: Date.now(),
     });
 
-    if (this.publisher) {
-      await this.publisher.publish(finalConfig);
-    }
+    const applyResult = this.publisher
+  ? await this.publisher.applyChange({
+      request,
+      previousConfig: currentConfig,
+      nextConfig: finalConfig,
+    })
+  : {
+      requestId: request.requestId,
+      targetType: request.targetType,
+      targetId: request.targetId,
+      applyMode: 'HOT_APPLY',
+      applied: true,
+      appliedAt: Date.now(),
+      message: 'Sin publisher runtime; cambio aceptado.',
+    };
+
+if (!applyResult.applied) {
+  await this.store.updateChangeRequestStatus(
+    request.requestId,
+    'REJECTED',
+    undefined,
+    [],
+  );
+
+  await this.store.appendAuditLog({
+    auditId: randomUUID(),
+    actor: approvedBy,
+    action: 'APPLY_CHANGE_REQUEST',
+    targetType: request.targetType,
+    targetId: request.targetId,
+    requestId: request.requestId,
+    versionBefore: currentConfig.version,
+    result: 'FAILURE',
+    message: applyResult.message ?? 'Falló la aplicación runtime.',
+    createdAt: Date.now(),
+  });
+
+  return {
+    request,
+    validation: {
+      ok: false,
+      errors: [],
+      warnings: [],
+    },
+    diff: [],
+    published: false,
+  };
+}
 
     this.currentConfig = finalConfig;
 
