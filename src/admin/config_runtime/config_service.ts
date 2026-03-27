@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 
 import type { AppConfig, RunMode, Venue } from '../types';
 import { ConfigValidator, type ValidatorContext } from './config_validator';
+import { RuntimeConfigApplier } from './runtime_config_applier';
 import type {
   AccountRiskPatch,
   AllocationPolicy,
@@ -13,7 +14,6 @@ import type {
   ConfigTargetType,
   ConfigVersionSnapshot,
   EffectiveRuntimeConfig,
-  RuntimeConfigPublisher,
   StrategyAllocationPatch,
   StrategyLifecyclePatch,
   StrategyParamsPatch,
@@ -56,13 +56,13 @@ export interface ApplyChangeRequestResult {
 export class ConfigService {
   private currentConfig: EffectiveRuntimeConfig | null = null;
 
-  constructor(
-    private readonly baseConfig: AppConfig,
-    private readonly store: ConfigStore,
-    private readonly validator: ConfigValidator,
-    private readonly contextProvider: ValidationContextProvider,
-    private readonly publisher?: RuntimeConfigPublisher,
-  ) {}
+constructor(
+  private readonly baseConfig: AppConfig,
+  private readonly store: ConfigStore,
+  private readonly validator: ConfigValidator,
+  private readonly contextProvider: ValidationContextProvider,
+  private readonly runtimeApplier?: RuntimeConfigApplier,
+) {}
 
   async initialize(actor = 'system'): Promise<EffectiveRuntimeConfig> {
     const stored = await this.store.getEffectiveConfig();
@@ -106,9 +106,9 @@ export class ConfigService {
       createdAt: Date.now(),
     });
 
-    if (this.publisher) {
-      await this.publisher.publish(bootstrapConfig);
-    }
+    if (this.runtimeApplier) {
+  await this.runtimeApplier.publish(bootstrapConfig);
+}
 
     this.currentConfig = bootstrapConfig;
     return bootstrapConfig;
@@ -417,9 +417,9 @@ if (!applyResult.applied) {
       createdAt: Date.now(),
     });
 
-    if (this.publisher) {
-      await this.publisher.publish(rollbackConfig);
-    }
+ if (this.runtimeApplier) {
+  await this.runtimeApplier.publish(rollbackConfig);
+}
 
     this.currentConfig = rollbackConfig;
     return rollbackConfig;
