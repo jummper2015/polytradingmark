@@ -5,8 +5,6 @@ import { ConfigValidator, type ValidatorContext } from './config_validator';
 import { RuntimeConfigApplier } from './runtime_config_applier';
 import type {
   AccountRiskPatch,
-  AllocationPolicy,
-  AuditLogEntry,
   ConfigChangeRequest,
   ConfigDiffEntry,
   ConfigPatchPayload,
@@ -249,16 +247,32 @@ constructor(
       };
     }
 
-    const diff = this.buildDiff(currentConfig, candidateConfig);
-    const finalConfig: EffectiveRuntimeConfig = {
-      ...candidateConfig,
-      version: currentConfig.version + 1,
-      generatedAt: Date.now(),
-      source: 'ADMIN_CHANGE',
+const diff = this.buildDiff(currentConfig, candidateConfig);
+const finalConfig: EffectiveRuntimeConfig = {
+  ...candidateConfig,
+  version: currentConfig.version + 1,
+  generatedAt: Date.now(),
+  source: 'ADMIN_CHANGE',
+};
+
+    //await this.store.saveEffectiveConfig(finalConfig);
+    // 1) Primero intentar aplicar al runtime
+const applyResult = this.runtimeApplier
+  ? await this.runtimeApplier.applyChange({
+      request,
+      previousConfig: currentConfig,
+      nextConfig: finalConfig,
+    })
+  : {
+      requestId: request.requestId,
+      targetType: request.targetType,
+      targetId: request.targetId,
+      applyMode: 'HOT_APPLY' as const,
+      applied: true,
+      appliedAt: Date.now(),
+      message: 'Sin runtimeApplier; cambio aceptado localmente.',
     };
-
-    await this.store.saveEffectiveConfig(finalConfig);
-
+/*
     const versionSnapshot: ConfigVersionSnapshot = {
       version: finalConfig.version,
       source: finalConfig.source,
@@ -267,16 +281,25 @@ constructor(
       createdBy: approvedBy,
       comment: this.extractReason(request.payload) ?? request.comment,
     };
-
-    await this.store.createVersion(versionSnapshot);
-
+*/
+    // 2) Si el runtime no pudo aplicarla, no persistimos
+if (!applyResult.applied) {
+  await this.store.updateChangeRequestStatus(
+    request.requestId,
+    'REJECTED',
+    undefined,
+    configValidation.warnings,
+  );
+   // await this.store.createVersion(versionSnapshot);
+/*
     await this.store.updateChangeRequestStatus(
       request.requestId,
       'APPLIED',
       undefined,
       [...requestValidation.warnings, ...configValidation.warnings],
     );
-
+*/
+    /*
     await this.store.appendAuditLog({
       auditId: randomUUID(),
       actor: approvedBy,
@@ -291,7 +314,7 @@ constructor(
       message: this.extractReason(request.payload) ?? 'Cambio aplicado.',
       createdAt: Date.now(),
     });
-
+*/
     const applyResult = this.publisher
   ? await this.publisher.applyChange({
       request,
@@ -330,17 +353,22 @@ if (!applyResult.applied) {
   });
 
   return {
-    request,
+    request: {
+      ...request,
+      status: 'REJECTED',
+      approvedBy,
+      approvedAt: Date.now(),
+    },
     validation: {
       ok: false,
       errors: [],
-      warnings: [],
+      warnings: configValidation.warnings,
     },
     diff: [],
     published: false,
   };
 }
-
+/*
     this.currentConfig = finalConfig;
 
     return {
@@ -359,7 +387,65 @@ if (!applyResult.applied) {
       diff,
       published: Boolean(this.publisher),
     };
+    */
   }
+    // 3) Si el runtime sí la aplicó, recién ahí persistimos
+await this.store.saveEffectiveConfig(finalConfig);
+
+const versionSnapshot: ConfigVersionSnapshot = {
+  version: finalConfig.version,
+  source: finalConfig.source,
+  config: finalConfig,
+  createdAt: finalConfig.generatedAt,
+  createdBy: approvedBy,
+  comment: this.extractReason(request.payload) ?? request.comment,
+};
+
+await this.store.createVersion(versionSnapshot);
+
+await this.store.updateChangeRequestStatus(
+  request.requestId,
+  'APPLIED',
+  undefined,
+  [...requestValidation.warnings, ...configValidation.warnings],
+);
+
+  await this.store.appendAuditLog({
+  auditId: randomUUID(),
+  actor: approvedBy,
+  action: 'APPLY_CHANGE_REQUEST',
+  targetType: request.targetType,
+  targetId: request.targetId,
+  requestId: request.requestId,
+  versionBefore: currentConfig.version,
+  versionAfter: finalConfig.version,
+  diff,
+  result: 'SUCCESS',
+  message:
+    applyResult.message ??
+    this.extractReason(request.payload) ??
+    'Cambio aplicado.',
+  createdAt: Date.now(),
+});
+
+this.currentConfig = finalConfig;
+
+return {
+  request: {
+    ...request,
+    status: 'APPLIED',
+    approvedBy,
+    approvedAt: Date.now(),
+  },
+  validation: {
+    ok: true,
+    errors: [],
+    warnings: [...requestValidation.warnings, ...configValidation.warnings],
+  },
+  config: finalConfig,
+  diff,
+  published: Boolean(this.runtimeApplier),
+};
 
   async rollbackToVersion(
     version: number,
