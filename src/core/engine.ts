@@ -7,6 +7,18 @@ import { STRATEGY_REGISTRY } from '../strategies/registry';
 import { AppConfig, MarketData } from '../types';
 import { logger } from '../reporting/logs';
 import { consoleLog } from '../reporting/console_log';
+import type { EffectiveRuntimeConfig, RuntimeConfigSubscriber } from '../config_runtime/types';
+
+export class EngineConfigSubscriber implements RuntimeConfigSubscriber {
+  constructor(private readonly engine: { updateRuntimeConfig: (config: EffectiveRuntimeConfig) => Promise<void> | void }) {}
+
+  async onConfigUpdated(config: EffectiveRuntimeConfig): Promise<void> {
+    await this.engine.updateRuntimeConfig(config);
+  }
+}
+async updateRuntimeConfig(config: EffectiveRuntimeConfig): Promise<void> {
+  this.runtimeConfig = config;
+}
 
 interface StrategyRunner {
   strategy: StrategyInterface;
