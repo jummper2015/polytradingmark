@@ -358,3 +358,24 @@ export interface RuntimeConfigPublisher {
 export interface RuntimeConfigSubscriber {
   onConfigUpdated(config: EffectiveRuntimeConfig): Promise<void>;
 }
+export interface ConfigStore {
+  getEffectiveConfig(): Promise<EffectiveRuntimeConfig | null>;
+  saveEffectiveConfig(config: EffectiveRuntimeConfig): Promise<void>;
+
+  createVersion(snapshot: ConfigVersionSnapshot): Promise<void>;
+  getVersion(version: number): Promise<ConfigVersionSnapshot | null>;
+  listVersions(limit?: number): Promise<ConfigVersionSnapshot[]>;
+
+  createChangeRequest(request: ConfigChangeRequest): Promise<void>;
+  updateChangeRequestStatus(
+    requestId: string,
+    status: ConfigChangeRequestStatus,
+    validationErrors?: ValidationError[],
+    validationWarnings?: ValidationWarning[],
+  ): Promise<void>;
+  getChangeRequest(requestId: string): Promise<ConfigChangeRequest | null>;
+  listPendingChangeRequests(): Promise<ConfigChangeRequest[]>;
+
+  appendAuditLog(entry: AuditLogEntry): Promise<void>;
+  updateChangeRequest(request: ConfigChangeRequest): Promise<void>;
+}
