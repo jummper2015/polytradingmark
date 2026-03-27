@@ -4,12 +4,15 @@ import { RiskEngine } from '../risk/risk_engine';
 import { TradeExecutor } from './trade_executor';
 import { logger } from '../reporting/logs';
 import { consoleLog } from '../reporting/console_log';
+import type { EffectiveRuntimeConfig } from '../config_runtime/types';
 
 export class OrderRouter {
   constructor(
     private readonly walletManager: WalletManager,
     private readonly riskEngine: RiskEngine,
     private readonly tradeExecutor: TradeExecutor,
+    private runtimeConfig: EffectiveRuntimeConfig | null = null;
+    private readonly strategyWalletMap = new Map<string, string>();
   ) {}
 
   async route(order: OrderRequest): Promise<boolean> {
