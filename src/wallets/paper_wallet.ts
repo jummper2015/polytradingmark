@@ -1,187 +1,546 @@
-import { WalletConfig, WalletState, Position, TradeRecord, RiskLimits } from '../types';
-import { FillSimulator } from '../paper_trading/fill_simulator';
-import { PnlTracker } from '../paper_trading/pnl_tracker';
 import { logger } from '../reporting/logs';
 import { consoleLog } from '../reporting/console_log';
+import { FillSimulator } from '../paper_trading/fill_simulator';
+import { PnlTracker } from '../paper_trading/pnl_tracker';
+
+type WalletMode = 'PAPER' | 'LIVE' | 'DISABLED';
+
+interface PaperWalletConfig {
+  id: string;
+  mode?: WalletMode;
+  strategy?: string;
+  capital?: number;
+  riskLimits?: Record<string, unknown>;
+  label?: string;
+}
+
+interface PaperOrderInput {
+  marketId: string;
+  outcome: string;
+  side: string;
+  price: number;
+  size: number;
+
+  // campos opcionales enriquecidos
+  strategyRunId?: string;
+  eventId?: string;
+  eventSlug?: string;
+  seriesSlug?: string;
+  question?: string;
+  slug?: string;
+
+  [key: string]: unknown;
+}
+
+interface PaperPosition {
+  marketId: string;
+  outcome: string;
+
+  size: number;
+  shares?: number;
+
+  avgPrice: number;
+  avgEntryPrice?: number;
+
+  realizedPnl?: number;
+
+  eventId?: string;
+  eventSlug?: string;
+  seriesSlug?: string;
+  question?: string;
+  slug?: string;
+
+  openedAt?: number;
+  updatedAt?: number;
+
+  [key: string]: unknown;
+}
+
+interface PaperTradeRecord {
+  tradeId: string;
+  walletId: string;
+  strategy?: string;
+  strategyRunId?: string;
+
+  marketId: string;
+  outcome: string;
+  side: string;
+
+  price: number;
+  size: number;
+  notional: number;
+
+  realizedPnl?: number;
+
+  eventId?: string;
+  eventSlug?: string;
+  seriesSlug?: string;
+  question?: string;
+  slug?: string;
+
+  timestamp: number;
+  meta?: Record<string, unknown>;
+}
 
 export class PaperWallet {
-  private state: WalletState;
-  private readonly fillSimulator = new FillSimulator();
-  private readonly pnlTracker = new PnlTracker();
-  private readonly trades: TradeRecord[] = [];
-  private displayName: string = '';
+  private readonly walletId: string;
+  private readonly mode: WalletMode;
+  private readonly assignedStrategy?: string;
 
-  constructor(config: WalletConfig, assignedStrategy: string) {
-    this.displayName = config.id;
-    this.state = {
-      walletId: config.id,
-      mode: 'PAPER',
-      assignedStrategy,
-      capitalAllocated: config.capital,
-      availableBalance: config.capital,
-      openPositions: [],
-      realizedPnl: 0,
-      riskLimits: {
-        maxPositionSize: config.riskLimits?.maxPositionSize ?? 100,
-        maxExposurePerMarket: config.riskLimits?.maxExposurePerMarket ?? 200,
-        maxDailyLoss: config.riskLimits?.maxDailyLoss ?? 100,
-        maxOpenTrades: config.riskLimits?.maxOpenTrades ?? 5,
-        maxDrawdown: config.riskLimits?.maxDrawdown ?? 0.2,
-      },
-    };
-  }
+  private capitalAllocated: number;
+  private availableBalance: number;
+  private realizedPnl = 0;
+  private dailyPnl = 0;
 
-  getState(): WalletState {
-    return { ...this.state, openPositions: [...this.state.openPositions] };
-  }
+  private peakEquity: number;
+  private currentEquity: number;
+  private drawdownPct = 0;
 
-  getTradeHistory(): TradeRecord[] {
-    return [...this.trades];
-  }
+  private riskLimits: Record<string, unknown>;
+  private openPositions: PaperPosition[] = [];
+  private tradeHistory: PaperTradeRecord[] = [];
 
-  updateBalance(delta: number): void {
-    this.state.availableBalance += delta;
-  }
+  private label?: string;
 
-  getDisplayName(): string {
-    return this.displayName;
-  }
+  // Mantengo estos módulos porque ya existen en el repo.
+  // Los uso de forma tolerante para no depender de una firma exacta.
+  private readonly fillSimulator: any;
+  private readonly pnlTracker: any;
 
-  setDisplayName(name: string): void {
-    this.displayName = name.trim() || this.state.walletId;
-  }
+  constructor(config: PaperWalletConfig) {
+    this.walletId = config.id;
+    this.mode = 'PAPER';
+    this.assignedStrategy = config.strategy;
+    this.capitalAllocated = Number(config.capital ?? 10000);
+    this.availableBalance = this.capitalAllocated;
+    this.peakEquity = this.capitalAllocated;
+    this.currentEquity = this.capitalAllocated;
+    this.riskLimits = { ...(config.riskLimits ?? {}) };
+    this.label = config.label;
 
-  updateRiskLimits(limits: Partial<RiskLimits>): void {
-    if (limits.maxPositionSize !== undefined) this.state.riskLimits.maxPositionSize = limits.maxPositionSize;
-    if (limits.maxExposurePerMarket !== undefined) this.state.riskLimits.maxExposurePerMarket = limits.maxExposurePerMarket;
-    if (limits.maxDailyLoss !== undefined) this.state.riskLimits.maxDailyLoss = limits.maxDailyLoss;
-    if (limits.maxOpenTrades !== undefined) this.state.riskLimits.maxOpenTrades = limits.maxOpenTrades;
-    if (limits.maxDrawdown !== undefined) this.state.riskLimits.maxDrawdown = limits.maxDrawdown;
-    logger.info({ walletId: this.state.walletId, riskLimits: this.state.riskLimits }, 'Risk limits updated');
-  }
-
-  async placeOrder(request: {
-    marketId: string;
-    outcome: 'YES' | 'NO';
-    side: 'BUY' | 'SELL';
-    price: number;
-    size: number;
-  }): Promise<void> {
-    const fill = this.fillSimulator.simulate(request);
-
-    // Capture entry price BEFORE applyFill mutates the position
-    // (on full close, applyFill resets avgPrice to 0)
-    const existingPos = this.state.openPositions.find(
-      (p) => p.marketId === fill.marketId && p.outcome === fill.outcome,
-    );
-    // For an existing position, use cost basis. For a naked SELL (no prior BUY),
-    // entryPrice = 0 so the full proceeds count as realized profit.
-    const entryPrice = existingPos ? existingPos.avgPrice : 0;
-
-    const position = this.applyFill(fill);
-    const pnl = this.pnlTracker.recordFill(fill, position, entryPrice);
-    this.state.realizedPnl += pnl.realized;
-    const cost = fill.price * fill.size * (fill.side === 'BUY' ? 1 : -1);
-    this.state.availableBalance -= cost;
-
-    this.trades.push({
-      orderId: fill.orderId,
-      walletId: this.state.walletId,
-      marketId: fill.marketId,
-      outcome: fill.outcome,
-      side: fill.side,
-      price: fill.price,
-      size: fill.size,
-      cost: Math.abs(cost),
-      realizedPnl: pnl.realized,
-      cumulativePnl: this.state.realizedPnl,
-      balanceAfter: this.state.availableBalance,
-      timestamp: fill.timestamp,
-    });
+    this.fillSimulator = new FillSimulator();
+    this.pnlTracker = new PnlTracker();
 
     logger.info(
       {
-        walletId: this.state.walletId,
-        marketId: fill.marketId,
-        price: fill.price,
-        size: fill.size,
+        walletId: this.walletId,
+        strategy: this.assignedStrategy,
+        capital: this.capitalAllocated,
       },
-      `${this.state.walletId} PAPER fill ${fill.side} ${fill.outcome} market=${fill.marketId} price=${fill.price} size=${fill.size}`,
+      'PaperWallet initialized',
     );
 
-    consoleLog.success('FILL', `[${this.state.walletId}] ${fill.side} ${fill.outcome} ×${fill.size} @ $${fill.price} → PnL $${pnl.realized.toFixed(2)} | Bal $${this.state.availableBalance.toFixed(2)}`, {
-      walletId: this.state.walletId,
-      strategy: this.state.assignedStrategy,
-      orderId: fill.orderId,
-      marketId: fill.marketId,
-      outcome: fill.outcome,
-      side: fill.side,
-      price: fill.price,
-      size: fill.size,
-      cost: Math.abs(cost),
-      realizedPnl: Number(pnl.realized.toFixed(4)),
-      cumulativePnl: Number(this.state.realizedPnl.toFixed(4)),
-      balanceAfter: Number(this.state.availableBalance.toFixed(2)),
-      openPositions: this.state.openPositions.length,
-    });
+    consoleLog.info(
+      'WALLET',
+      `PaperWallet initialized: ${this.walletId}`,
+      {
+        walletId: this.walletId,
+        strategy: this.assignedStrategy,
+        capital: this.capitalAllocated,
+      },
+    );
   }
 
-  private applyFill(fill: {
-    marketId: string;
-    outcome: 'YES' | 'NO';
-    side: 'BUY' | 'SELL';
-    price: number;
-    size: number;
-  }): Position {
-    const existing = this.state.openPositions.find(
-      (pos) => pos.marketId === fill.marketId && pos.outcome === fill.outcome,
-    );
-    if (!existing) {
-      if (fill.side === 'SELL') {
-        // Selling without a position — return a phantom position, don't add to state
-        return {
-          marketId: fill.marketId,
-          outcome: fill.outcome,
-          size: 0,
-          avgPrice: fill.price,
-          realizedPnl: 0,
-        };
-      }
-      const position: Position = {
-        marketId: fill.marketId,
-        outcome: fill.outcome,
-        size: fill.size,
-        avgPrice: fill.price,
-        realizedPnl: 0,
-      };
-      this.state.openPositions.push(position);
-      return position;
+  /* =========================================================
+   * Public API
+   * ======================================================= */
+
+  getState(): Record<string, unknown> {
+    this.refreshDerivedState();
+
+    return {
+      walletId: this.walletId,
+      id: this.walletId,
+      mode: this.mode,
+      assignedStrategy: this.assignedStrategy,
+      capitalAllocated: this.capitalAllocated,
+      availableBalance: this.availableBalance,
+      balance: this.availableBalance,
+      openPositions: this.clone(this.openPositions),
+      realizedPnl: this.realizedPnl,
+      dailyPnl: this.dailyPnl,
+      peakEquity: this.peakEquity,
+      currentEquity: this.currentEquity,
+      drawdownPct: this.drawdownPct,
+      riskLimits: { ...this.riskLimits },
+      label: this.label,
+    };
+  }
+
+  getTradeHistory(): PaperTradeRecord[] {
+    return this.clone(this.tradeHistory);
+  }
+
+  getName(): string {
+    return this.label ?? this.walletId;
+  }
+
+  setLabel(label: string): void {
+    this.label = label;
+  }
+
+  updateRiskLimits(nextRiskLimits: Record<string, unknown>): void {
+    this.riskLimits = {
+      ...this.riskLimits,
+      ...nextRiskLimits,
+    };
+  }
+
+  setCapitalAllocated(nextCapital: number): void {
+    if (!Number.isFinite(nextCapital) || nextCapital <= 0) {
+      throw new Error('setCapitalAllocated: capital inválido');
     }
 
-    if (fill.side === 'BUY') {
-      // Adding to position — update cost basis with weighted average
-      const newSize = existing.size + fill.size;
-      existing.avgPrice =
-        (existing.avgPrice * existing.size + fill.price * fill.size) / newSize;
-      existing.size = newSize;
+    const oldCapital = this.capitalAllocated;
+    const delta = nextCapital - oldCapital;
+
+    this.capitalAllocated = nextCapital;
+    this.availableBalance += delta;
+
+    // Evitar balance disponible negativo si reduces capital con posiciones abiertas
+    if (this.availableBalance < 0) {
+      this.availableBalance = 0;
+    }
+
+    this.refreshDerivedState();
+
+    logger.info(
+      {
+        walletId: this.walletId,
+        oldCapital,
+        newCapital: nextCapital,
+        delta,
+      },
+      'PaperWallet capital updated',
+    );
+
+    consoleLog.info(
+      'WALLET',
+      `Paper capital updated: ${this.walletId}`,
+      {
+        walletId: this.walletId,
+        oldCapital,
+        newCapital: nextCapital,
+        delta,
+      },
+    );
+  }
+
+  async placeOrder(order: PaperOrderInput): Promise<boolean> {
+    this.validateOrder(order);
+
+    const fillPrice = this.resolveFillPrice(order);
+    const side = String(order.side).toUpperCase();
+    const size = Number(order.size);
+    const notional = fillPrice * size;
+
+    if (side === 'BUY') {
+      if (notional > this.availableBalance) {
+        throw new Error(
+          `PaperWallet insufficient balance: required=${notional.toFixed(2)} available=${this.availableBalance.toFixed(2)}`
+        );
+      }
+
+      this.applyBuy(order, fillPrice);
+      this.availableBalance -= notional;
+
+      this.tradeHistory.push(
+        this.buildTradeRecord(order, fillPrice, size, notional, 0),
+      );
+    } else if (side === 'SELL') {
+      const realizedPnl = this.applySell(order, fillPrice);
+      this.availableBalance += notional;
+      this.realizedPnl += realizedPnl;
+      this.dailyPnl += realizedPnl;
+
+      this.tradeHistory.push(
+        this.buildTradeRecord(order, fillPrice, size, notional, realizedPnl),
+      );
     } else {
-      // Reducing / closing position — keep avgPrice (cost basis) unchanged
-      const reduceQty = Math.min(fill.size, existing.size);
-      existing.size -= reduceQty;
-      // If fully closed, reset avgPrice
-      if (existing.size <= 0) {
-        existing.size = 0;
-        existing.avgPrice = 0;
-      }
-      // avgPrice stays the same for partial closes — this is critical for
-      // correct realized PnL: (fillPrice − entryPrice) × qty
+      throw new Error(`PaperWallet unsupported side: ${order.side}`);
     }
 
-    // Clean up zero-size positions
-    this.state.openPositions = this.state.openPositions.filter(
-      (p) => p.size > 0,
+    this.refreshDerivedState();
+
+    logger.info(
+      {
+        walletId: this.walletId,
+        strategyRunId: order.strategyRunId,
+        marketId: order.marketId,
+        outcome: order.outcome,
+        side,
+        price: fillPrice,
+        size,
+      },
+      'PaperWallet placed order',
     );
 
-    return existing;
+    consoleLog.success(
+      'PAPER',
+      `Paper order executed: ${side} ${order.outcome} x${size} @ ${fillPrice}`,
+      {
+        walletId: this.walletId,
+        strategyRunId: order.strategyRunId,
+        marketId: order.marketId,
+        outcome: order.outcome,
+        side,
+        price: fillPrice,
+        size,
+        availableBalance: this.availableBalance,
+        realizedPnl: this.realizedPnl,
+      },
+    );
+
+    return true;
+  }
+
+  /* =========================================================
+   * Core order application
+   * ======================================================= */
+
+  private applyBuy(order: PaperOrderInput, fillPrice: number): void {
+    const existing = this.findPosition(order.marketId, order.outcome);
+    const now = Date.now();
+
+    if (!existing) {
+      this.openPositions.push({
+        marketId: order.marketId,
+        outcome: order.outcome,
+        size: Number(order.size),
+        shares: Number(order.size),
+        avgPrice: fillPrice,
+        avgEntryPrice: fillPrice,
+        realizedPnl: 0,
+        eventId: this.asOptionalString(order.eventId),
+        eventSlug: this.asOptionalString(order.eventSlug),
+        seriesSlug: this.asOptionalString(order.seriesSlug),
+        question: this.asOptionalString(order.question),
+        slug: this.asOptionalString(order.slug),
+        openedAt: now,
+        updatedAt: now,
+      });
+      return;
+    }
+
+    const oldSize = Number(existing.size ?? 0);
+    const newSize = Number(order.size);
+    const totalSize = oldSize + newSize;
+
+    const oldAvg = Number(existing.avgPrice ?? existing.avgEntryPrice ?? 0);
+    const weightedAvg =
+      totalSize > 0
+        ? (oldSize * oldAvg + newSize * fillPrice) / totalSize
+        : fillPrice;
+
+    existing.size = totalSize;
+    existing.shares = totalSize;
+    existing.avgPrice = weightedAvg;
+    existing.avgEntryPrice = weightedAvg;
+    existing.updatedAt = now;
+
+    // completar metadata si aún no existe
+    existing.eventId = existing.eventId ?? this.asOptionalString(order.eventId);
+    existing.eventSlug = existing.eventSlug ?? this.asOptionalString(order.eventSlug);
+    existing.seriesSlug = existing.seriesSlug ?? this.asOptionalString(order.seriesSlug);
+    existing.question = existing.question ?? this.asOptionalString(order.question);
+    existing.slug = existing.slug ?? this.asOptionalString(order.slug);
+  }
+
+  private applySell(order: PaperOrderInput, fillPrice: number): number {
+    const existing = this.findPosition(order.marketId, order.outcome);
+
+    if (!existing) {
+      throw new Error(
+        `PaperWallet cannot SELL without open position for market=${order.marketId} outcome=${order.outcome}`,
+      );
+    }
+
+    const heldSize = Number(existing.size ?? existing.shares ?? 0);
+    const sellSize = Number(order.size);
+
+    if (sellSize > heldSize) {
+      throw new Error(
+        `PaperWallet cannot SELL more than current position: sell=${sellSize} held=${heldSize}`,
+      );
+    }
+
+    const avgEntry = Number(existing.avgPrice ?? existing.avgEntryPrice ?? 0);
+    const realizedPnl = this.computeRealizedPnl(avgEntry, fillPrice, sellSize);
+    const remaining = heldSize - sellSize;
+    const now = Date.now();
+
+    existing.realizedPnl = Number(existing.realizedPnl ?? 0) + realizedPnl;
+    existing.updatedAt = now;
+
+    if (remaining <= 0) {
+      this.openPositions = this.openPositions.filter(
+        (p) => !(p.marketId === order.marketId && p.outcome === order.outcome),
+      );
+    } else {
+      existing.size = remaining;
+      existing.shares = remaining;
+    }
+
+    return realizedPnl;
+  }
+
+  /* =========================================================
+   * Helpers
+   * ======================================================= */
+
+  private findPosition(marketId: string, outcome: string): PaperPosition | undefined {
+    return this.openPositions.find(
+      (p) => p.marketId === marketId && p.outcome === outcome,
+    );
+  }
+
+  private validateOrder(order: PaperOrderInput): void {
+    if (!order?.marketId?.trim()) {
+      throw new Error('PaperWallet.placeOrder: marketId es obligatorio');
+    }
+
+    if (!order?.outcome?.trim()) {
+      throw new Error('PaperWallet.placeOrder: outcome es obligatorio');
+    }
+
+    if (!order?.side?.trim()) {
+      throw new Error('PaperWallet.placeOrder: side es obligatorio');
+    }
+
+    if (!Number.isFinite(Number(order.price)) || Number(order.price) <= 0) {
+      throw new Error('PaperWallet.placeOrder: price inválido');
+    }
+
+    if (!Number.isFinite(Number(order.size)) || Number(order.size) <= 0) {
+      throw new Error('PaperWallet.placeOrder: size inválido');
+    }
+  }
+
+  private resolveFillPrice(order: PaperOrderInput): number {
+    const rawPrice = Number(order.price);
+
+    // Intentar usar FillSimulator del repo si expone alguna firma conocida.
+    try {
+      if (this.fillSimulator) {
+        if (typeof this.fillSimulator.simulate === 'function') {
+          const simulated = this.fillSimulator.simulate(order);
+          const price =
+            simulated?.price ??
+            simulated?.fillPrice ??
+            simulated?.executedPrice;
+
+          if (Number.isFinite(price)) {
+            return Number(price);
+          }
+        }
+
+        if (typeof this.fillSimulator.simulateFill === 'function') {
+          const simulated = this.fillSimulator.simulateFill(order);
+          const price =
+            simulated?.price ??
+            simulated?.fillPrice ??
+            simulated?.executedPrice;
+
+          if (Number.isFinite(price)) {
+            return Number(price);
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          error,
+          walletId: this.walletId,
+          marketId: order.marketId,
+        },
+        'FillSimulator fallback to raw order price',
+      );
+    }
+
+    return rawPrice;
+  }
+
+  private computeRealizedPnl(entryPrice: number, exitPrice: number, size: number): number {
+    try {
+      if (this.pnlTracker) {
+        if (typeof this.pnlTracker.realize === 'function') {
+          const pnl = this.pnlTracker.realize(entryPrice, exitPrice, size);
+          if (Number.isFinite(pnl)) return Number(pnl);
+        }
+
+        if (typeof this.pnlTracker.computeRealizedPnl === 'function') {
+          const pnl = this.pnlTracker.computeRealizedPnl(entryPrice, exitPrice, size);
+          if (Number.isFinite(pnl)) return Number(pnl);
+        }
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          error,
+          walletId: this.walletId,
+        },
+        'PnlTracker fallback to local realized PnL calculation',
+      );
+    }
+
+    return (exitPrice - entryPrice) * size;
+  }
+
+  private buildTradeRecord(
+    order: PaperOrderInput,
+    fillPrice: number,
+    size: number,
+    notional: number,
+    realizedPnl: number,
+  ): PaperTradeRecord {
+    return {
+      tradeId: `paper-${this.walletId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      walletId: this.walletId,
+      strategy: this.assignedStrategy,
+      strategyRunId: this.asOptionalString(order.strategyRunId),
+      marketId: order.marketId,
+      outcome: order.outcome,
+      side: String(order.side).toUpperCase(),
+      price: fillPrice,
+      size,
+      notional,
+      realizedPnl,
+      eventId: this.asOptionalString(order.eventId),
+      eventSlug: this.asOptionalString(order.eventSlug),
+      seriesSlug: this.asOptionalString(order.seriesSlug),
+      question: this.asOptionalString(order.question),
+      slug: this.asOptionalString(order.slug),
+      timestamp: Date.now(),
+      meta: {},
+    };
+  }
+
+  private refreshDerivedState(): void {
+    const openNotional = this.openPositions.reduce((sum, p) => {
+      const size = Number(p.size ?? p.shares ?? 0);
+      const price = Number(p.avgPrice ?? p.avgEntryPrice ?? 0);
+      return sum + size * price;
+    }, 0);
+
+    this.currentEquity = this.availableBalance + openNotional + this.realizedPnl;
+
+    if (this.currentEquity > this.peakEquity) {
+      this.peakEquity = this.currentEquity;
+    }
+
+    this.drawdownPct =
+      this.peakEquity > 0
+        ? Math.max(0, (this.peakEquity - this.currentEquity) / this.peakEquity)
+        : 0;
+  }
+
+  private asOptionalString(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  private clone<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T;
   }
 }
