@@ -447,6 +447,8 @@ return {
   published: Boolean(this.runtimeApplier),
 };
 
+}
+
   async rollbackToVersion(
     version: number,
     actor: string,
@@ -895,14 +897,4 @@ return {
     return 'action' in payload &&
       ['KILL_SWITCH_ON', 'KILL_SWITCH_OFF'].includes(payload.action);
   }
-  private applyStrategyPayload(...) {
-  ...
-  if (this.isStrategyParamsPatch(payload)) {
-    strategy.params = {
-      ...(strategy.params ?? {}),
-      ...payload.params,
-    };
-    ...
-  }
-}
 }
